@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-coding-agent"
+version = "0.1.0"
+description = "A local CLI coding agent that talks to a self-hosted OpenAI-compatible model server."
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.scripts]
+agent = "local_agent.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,8 @@
+# this is a comment
+x = 15
+y = 4
+greeting = "Hello"
+
+for (x * y)
+    print greeting
+end

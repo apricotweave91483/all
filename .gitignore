@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+env/
+venv/
+.env
+.env.*
+
+# Local-only email/problem sender state and credentials
+/problem_emailer/CSES_sender_nonweekly/email_config.txt
+/problem_emailer/CSES_sender_nonweekly/email_config.local.txt
+/problem_emailer/CSES_sender_nonweekly/weekly_sender_state.json

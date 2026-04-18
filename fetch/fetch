@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEEN_FILE="$SCRIPT_DIR/.cf_seen_problems.json"
+CACHE_FILE="$SCRIPT_DIR/.cf_problems_cache.json"
+HISTORY_FILE="$SCRIPT_DIR/.cf_history.json"
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+die() { echo "❌ $*" >&2; exit 1; }
+
+# Sets CONTEST_ID and INDEX from a problem ID string like "1520A" or "292C1"
+parse_problem_id() {
+    local pid="${1// /}"
+    if [[ "$pid" =~ ^([0-9]+)([A-Za-z][0-9]*)$ ]]; then
+        CONTEST_ID="${BASH_REMATCH[1]}"
+        INDEX="${BASH_REMATCH[2]}"
+    else
+        die "Invalid problem ID format: $pid (expected e.g. 1520A)"
+    fi
+}
+
+# Sets MIN_DIFF and MAX_DIFF from a string like "800-1200" or "800"
+parse_difficulty_range() {
+    local str="$1"
+    if [[ "$str" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        MIN_DIFF="${BASH_REMATCH[1]}"
+        MAX_DIFF="${BASH_REMATCH[2]}"
+        if (( MIN_DIFF > MAX_DIFF )); then
+            local tmp=$MIN_DIFF; MIN_DIFF=$MAX_DIFF; MAX_DIFF=$tmp
+        fi
+    elif [[ "$str" =~ ^([0-9]+)$ ]]; then
+        MIN_DIFF="${BASH_REMATCH[1]}"
+        MAX_DIFF="$MIN_DIFF"
+    else
+        die "Invalid difficulty range format: $str (expected e.g. 800-1200 or 800)"
+    fi
+}
+
+# ─── seen list ────────────────────────────────────────────────────────────────
+
+load_seen_problems() {
+    [[ ! -f "$SEEN_FILE" ]] && { echo "[]"; return; }
+    jq -c '.seen_problems // []' "$SEEN_FILE" 2>/dev/null || echo "[]"
+}
+
+save_seen_problems() {
+    local arr="$1"
+    local count
+    count=$(echo "$arr" | jq 'length')
+    jq -n --argjson arr "$arr" --argjson count "$count" \
+        '{seen_problems: $arr, total_seen: $count}' > "$SEEN_FILE"
+}
+
+# ─── history ──────────────────────────────────────────────────────────────────
+
+load_history() {
+    [[ ! -f "$HISTORY_FILE" ]] && { echo "[]"; return; }
+    jq -ce 'if type == "array" then . else [] end' "$HISTORY_FILE" 2>/dev/null || echo "[]"
+}
+
+add_history_entry() {
+    local contest_id="$1" index="$2" name="$3" rating_json="$4"
+    local problem_id="${contest_id}${index}"
+    local url="https://codeforces.com/problemset/problem/${contest_id}/${index}"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S")
+
+    local entry
+    entry=$(jq -n \
+        --arg     id         "$problem_id" \
+        --arg     name       "$name" \
+        --argjson rating     "$rating_json" \
+        --argjson contestId  "$contest_id" \
+        --arg     index      "$index" \
+        --arg     url        "$url" \
+        --arg     timestamp  "$timestamp" \
+        '{id: $id, name: $name, rating: $rating,
+          contestId: $contestId, index: $index,
+          url: $url, timestamp: $timestamp}')
+
+    local history
+    history=$(load_history)
+    history=$(echo "$history" | jq -c --argjson e "$entry" '. + [$e] | .[-1000:]')
+    echo "$history" > "$HISTORY_FILE"
+}
+
+# ─── cache ────────────────────────────────────────────────────────────────────
+
+is_cache_valid() {
+    [[ ! -f "$CACHE_FILE" ]] && return 1
+    local ts
+    ts=$(jq -r '.timestamp // empty' "$CACHE_FILE" 2>/dev/null)
+    [[ -z "$ts" ]] && return 1
+    local cache_epoch now_epoch
+    # macOS BSD date: -j -f <fmt> <value> +%s
+    cache_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$ts" "+%s" 2>/dev/null) || return 1
+    now_epoch=$(date +%s)
+    (( now_epoch - cache_epoch < 86400 ))
+}
+
+load_cached_problems() {
+    jq -c '.problems // []' "$CACHE_FILE"
+}
+
+save_problems_cache() {
+    local problems="$1"
+    local count ts
+    count=$(echo "$problems" | jq 'length')
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%S")
+    # Pipe problems via stdin (.) to avoid hitting shell arg-length limits on large datasets
+    echo "$problems" | jq --argjson count "$count" --arg ts "$ts" \
+        '{timestamp: $ts, problems: ., count: $count}' > "$CACHE_FILE"
+}
+
+# ─── API fetch ────────────────────────────────────────────────────────────────
+
+fetch_all_problems() {
+    if is_cache_valid; then
+        local cached count
+        cached=$(load_cached_problems)
+        count=$(echo "$cached" | jq 'length')
+        echo "Using cached problems ($count problems)" >&2
+        echo "$cached"
+        return 0
+    fi
+
+    echo -n "Fetching problems from Codeforces API... " >&2
+
+    local api_url="https://codeforces.com/api/problemset.problems"
+    local response attempt max_retries=3
+
+    for (( attempt=1; attempt<=max_retries; attempt++ )); do
+        response=$(curl -sf --max-time 60 "$api_url" 2>/dev/null)
+        local curl_exit=$?
+
+        if (( curl_exit != 0 )); then
+            if (( attempt < max_retries )); then
+                echo -n "⏳ Timeout (attempt $attempt/$max_retries), retrying... " >&2
+                sleep 2; continue
+            fi
+            echo "❌ Timeout after $max_retries attempts" >&2
+            if is_cache_valid; then
+                echo "⚠️  Using cached problems instead" >&2
+                load_cached_problems; return 0
+            fi
+            return 1
+        fi
+
+        local status
+        status=$(echo "$response" | jq -r '.status' 2>/dev/null)
+
+        if [[ "$status" != "OK" ]]; then
+            local comment
+            comment=$(echo "$response" | jq -r '.comment // "Unknown error"')
+            echo "❌ API Error: $comment" >&2
+            if is_cache_valid; then
+                echo "⚠️  Using cached problems instead" >&2
+                load_cached_problems; return 0
+            fi
+            return 1
+        fi
+
+        local problems count
+        problems=$(echo "$response" | jq -c '.result.problems')
+        count=$(echo "$problems" | jq 'length')
+        echo "✓ Found $count problems" >&2
+        save_problems_cache "$problems"
+        echo "$problems"
+        return 0
+    done
+
+    return 1
+}
+
+# ─── usage ────────────────────────────────────────────────────────────────────
+
+show_usage() {
+    cat <<'EOF'
+Usage: fetch [OPTIONS]
+
+Get a random Codeforces problem by difficulty range, or open a specific problem.
+
+Options:
+  -d, --difficulty RANGE    Difficulty range (e.g. "800-1200" or "800")
+  -p, --problem ID          Open a specific problem by ID (e.g. "1520A")
+      --allow-repeat        Allow problems that have been seen before
+      --no-save             Don't save this problem to the seen list
+      --clear-seen          Clear the seen problems list
+      --stats               Show statistics about seen problems
+      --open                Open the problem in the default web browser
+      --mark-complete ID    Mark a problem as completed (e.g. 151A)
+      --remove ID           Remove a problem from the seen list (e.g. 151A)
+  -h [N], --history [N]     Show the last N fetched problems (default 10)
+      --help                Show this help message and exit
+
+Examples:
+  fetch --difficulty 800-1200
+  fetch -d 1500-2000
+  fetch -d 800 --allow-repeat
+  fetch -d 1200-1600 --no-save
+  fetch -d 800-1200 --open
+  fetch --problem 1520A
+  fetch -p 292A --open
+  fetch --mark-complete 151A
+  fetch --remove 151A
+  fetch -h 20
+EOF
+}
+
+# ─── argument parsing ─────────────────────────────────────────────────────────
+
+DIFFICULTY=""
+PROBLEM=""
+ALLOW_REPEAT=false
+NO_SAVE=false
+CLEAR_SEEN=false
+STATS=false
+DO_OPEN=false
+MARK_COMPLETE=""
+REMOVE_PROBLEM=""
+HISTORY_N=""    # empty = not requested; numeric = show that many entries
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--difficulty)
+            [[ -z "$2" ]] && die "--difficulty requires an argument"
+            DIFFICULTY="$2"; shift 2 ;;
+        -p|--problem)
+            [[ -z "$2" ]] && die "--problem requires an argument"
+            PROBLEM="$2"; shift 2 ;;
+        --allow-repeat)  ALLOW_REPEAT=true; shift ;;
+        --no-save)       NO_SAVE=true;      shift ;;
+        --clear-seen)    CLEAR_SEEN=true;   shift ;;
+        --stats)         STATS=true;        shift ;;
+        --open)          DO_OPEN=true;      shift ;;
+        --mark-complete)
+            [[ -z "$2" ]] && die "--mark-complete requires an argument"
+            MARK_COMPLETE="$2"; shift 2 ;;
+        --remove)
+            [[ -z "$2" ]] && die "--remove requires an argument"
+            REMOVE_PROBLEM="$2"; shift 2 ;;
+        -h|--history)
+            # Optional numeric argument
+            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                HISTORY_N="$2"; shift 2
+            else
+                HISTORY_N=10; shift
+            fi ;;
+        --help) show_usage; exit 0 ;;
+        *) echo "❌ Unknown option: $1" >&2; show_usage >&2; exit 1 ;;
+    esac
+done
+
+# ─── dispatch ─────────────────────────────────────────────────────────────────
+
+# history
+if [[ -n "$HISTORY_N" ]]; then
+    history=$(load_history)
+    total=$(echo "$history" | jq 'length')
+    if (( total == 0 )); then
+        echo "No fetched problems in history yet."
+        exit 0
+    fi
+    echo "$history" | jq -r --argjson n "$HISTORY_N" \
+        '.[-$n:] | to_entries[] |
+         "\(.key+1). \(.value.id)\(if .value.rating != null then " [\(.value.rating)]" else "" end) - \(.value.name)"'
+    exit 0
+fi
+
+# remove
+if [[ -n "$REMOVE_PROBLEM" ]]; then
+    parse_problem_id "$REMOVE_PROBLEM"
+    pid="${CONTEST_ID}${INDEX}"
+    seen=$(load_seen_problems)
+    if echo "$seen" | jq -e --arg p "$pid" 'index($p) != null' > /dev/null 2>&1; then
+        seen=$(echo "$seen" | jq -c --arg p "$pid" '[.[] | select(. != $p)]')
+        save_seen_problems "$seen"
+        count=$(echo "$seen" | jq 'length')
+        echo "✓ Removed $pid from seen list ($count remaining)"
+    else
+        echo "$pid was not in the seen list"
+    fi
+    exit 0
+fi
+
+# mark-complete
+if [[ -n "$MARK_COMPLETE" ]]; then
+    parse_problem_id "$MARK_COMPLETE"
+    pid="${CONTEST_ID}${INDEX}"
+    seen=$(load_seen_problems)
+    if echo "$seen" | jq -e --arg p "$pid" 'index($p) != null' > /dev/null 2>&1; then
+        count=$(echo "$seen" | jq 'length')
+        echo "$pid was already marked complete ($count total in list)"
+    else
+        seen=$(echo "$seen" | jq -c --arg p "$pid" '. + [$p]')
+        save_seen_problems "$seen"
+        count=$(echo "$seen" | jq 'length')
+        echo "✓ Marked $pid as complete ($count total in list)"
+    fi
+    exit 0
+fi
+
+# clear-seen
+if $CLEAR_SEEN; then
+    if [[ ! -f "$SEEN_FILE" ]]; then
+        echo "No seen problems list to clear"
+        exit 0
+    fi
+    read -r -p "Are you sure? [y/N]: " a1
+    [[ "${a1,,}" != "y" && "${a1,,}" != "yes" ]] && { echo "Cancelled."; exit 0; }
+    read -r -p "Are you sure sure? [y/N]: " a2
+    [[ "${a2,,}" != "y" && "${a2,,}" != "yes" ]] && { echo "Cancelled."; exit 0; }
+    rm "$SEEN_FILE"
+    echo "✓ Cleared seen problems list"
+    exit 0
+fi
+
+# stats
+if $STATS; then
+    seen=$(load_seen_problems)
+    count=$(echo "$seen" | jq 'length')
+    echo "Total problems seen: $count"
+    (( count > 0 )) && echo "Seen problems file: $SEEN_FILE"
+    exit 0
+fi
+
+# specific problem
+if [[ -n "$PROBLEM" ]]; then
+    parse_problem_id "$PROBLEM"
+    url="https://codeforces.com/problemset/problem/${CONTEST_ID}/${INDEX}"
+    echo "Problem $PROBLEM"
+    echo "URL: $url"
+    if $DO_OPEN; then
+        open "$url" && echo "✓ Opened in default browser" || die "Could not open browser"
+    else
+        echo "(Use --open to open in your browser)"
+    fi
+    exit 0
+fi
+
+# require --difficulty
+if [[ -z "$DIFFICULTY" ]]; then
+    echo "❌ Either --difficulty or --problem must be provided" >&2
+    show_usage >&2
+    exit 1
+fi
+
+parse_difficulty_range "$DIFFICULTY"
+
+# fetch + filter
+all_problems=$(fetch_all_problems) || die "Failed to fetch problems"
+
+filtered=$(echo "$all_problems" | jq -c \
+    --argjson min "$MIN_DIFF" --argjson max "$MAX_DIFF" \
+    '[.[] | select(.rating != null and .rating >= $min and .rating <= $max)]')
+
+filtered_count=$(echo "$filtered" | jq 'length')
+
+(( filtered_count == 0 )) && die "No problems found in difficulty range ${MIN_DIFF}-${MAX_DIFF}"
+
+echo "Found $filtered_count problems in range ${MIN_DIFF}-${MAX_DIFF}"
+
+# exclude seen
+if ! $ALLOW_REPEAT; then
+    seen=$(load_seen_problems)
+    available=$(echo "$filtered" | jq -c \
+        --argjson seen "$seen" \
+        '[.[] | ((.contestId | tostring) + .index) as $id | select($seen | index($id) == null)]')
+    available_count=$(echo "$available" | jq 'length')
+
+    if (( available_count == 0 )); then
+        echo "⚠️  All $filtered_count problems in this range have been seen!"
+        echo "   Returning a random one anyway (or use --allow-repeat to see all)"
+        available="$filtered"
+        available_count="$filtered_count"
+    fi
+else
+    available="$filtered"
+    available_count="$filtered_count"
+fi
+
+# pick random (RANDOM goes 0–32767; filtered lists are well under that)
+rand_idx=$(( RANDOM % available_count ))
+problem=$(echo "$available" | jq -c ".[$rand_idx]")
+
+contest_id=$(echo "$problem" | jq -r '.contestId')
+index=$(echo "$problem"     | jq -r '.index')
+name=$(echo "$problem"      | jq -r '.name')
+rating=$(echo "$problem"    | jq -r '.rating')
+rating_json=$(echo "$problem" | jq '.rating')   # preserve null as JSON null
+problem_id="${contest_id}${index}"
+url="https://codeforces.com/problemset/problem/${contest_id}/${index}"
+
+echo ""
+echo "🎯 Problem: $problem_id"
+echo "   Name: $name"
+echo "   Difficulty: $rating"
+echo "   URL: $url"
+
+add_history_entry "$contest_id" "$index" "$name" "$rating_json"
+
+if $DO_OPEN; then
+    open "$url" && echo "   (Opened in default browser)" || echo "   ⚠️ Could not open browser"
+fi
+
+if ! $NO_SAVE; then
+    seen=$(load_seen_problems)
+    seen=$(echo "$seen" | jq -c --arg p "$problem_id" '. + [$p]')
+    save_seen_problems "$seen"
+    count=$(echo "$seen" | jq 'length')
+    echo ""
+    echo "✓ Saved to seen problems list ($count total)"
+fi

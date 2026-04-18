@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MODEL="gemma4:e4b"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ai_file"
+LOG_FILE="$STATE_DIR/ollama-serve.log"
+PID_FILE="$STATE_DIR/ollama-serve.pid"
+STARTED_OLLAMA=0
+SERVER_PID=""
+SPINNER_PID=""
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  ai_file "prompt"
+  echo "prompt" | ai_file
+
+Generates file contents on stdout using Ollama model gemma4:e2b by default.
+Operational messages go to stderr so stdout can be redirected directly into a file.
+EOF
+}
+
+stderr() {
+  printf '%s\n' "$*" >&2
+}
+
+_show_spinner() {
+  local message="$1"
+  local frames='|/-\'
+  local frame_index=0
+  local frame_count=${#frames}
+
+  while :; do
+    printf '\r[%s] %s' "${frames:frame_index:1}" "$message" >&2
+    frame_index=$(((frame_index + 1) % frame_count))
+    sleep 0.1
+  done
+}
+
+start_spinner() {
+  local message="$1"
+
+  if [[ -n "$SPINNER_PID" ]]; then
+    stop_spinner
+  fi
+
+  if [[ -t 2 ]]; then
+    _show_spinner "$message" &
+    SPINNER_PID="$!"
+    return 0
+  fi
+
+  stderr "$message"
+}
+
+stop_spinner() {
+  local message="${1:-}"
+
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+
+    if [[ -t 2 ]]; then
+      printf '\r\033[K' >&2
+    fi
+  fi
+
+  if [[ -n "$message" ]]; then
+    stderr "$message"
+  fi
+}
+
+cleanup() {
+  local pid_in_file=""
+
+  stop_spinner
+
+  if [[ "$STARTED_OLLAMA" -ne 1 || -z "$SERVER_PID" ]]; then
+    return 0
+  fi
+
+  if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+
+  if [[ -f "$PID_FILE" ]]; then
+    pid_in_file="$(<"$PID_FILE")"
+    if [[ "$pid_in_file" == "$SERVER_PID" ]]; then
+      rm -f "$PID_FILE"
+    fi
+  fi
+}
+
+collect_prompt() {
+  if (($# > 0)); then
+    printf '%s' "$*"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    cat
+    return 0
+  fi
+
+  usage
+  exit 64
+}
+
+ollama_ready() {
+  ollama list >/dev/null 2>&1
+}
+
+wait_for_ollama() {
+  local _attempt
+
+  for _attempt in {1..30}; do
+    if ollama_ready; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
+start_ollama_server() {
+  mkdir -p "$STATE_DIR"
+  nohup ollama serve >"$LOG_FILE" 2>&1 &
+  SERVER_PID="$!"
+  STARTED_OLLAMA=1
+  printf '%s\n' "$SERVER_PID" >"$PID_FILE"
+  start_spinner "ai_file: starting ollama serve"
+
+  if wait_for_ollama; then
+    stop_spinner "ai_file: ollama serve is ready"
+    return 0
+  fi
+
+  stop_spinner "ai_file: ollama serve did not become ready"
+  stderr "ai_file: see $LOG_FILE"
+  exit 1
+}
+
+ensure_ollama_server() {
+  if ollama_ready; then
+    return 0
+  fi
+
+  start_ollama_server
+}
+
+ensure_model() {
+  if ollama show "$MODEL" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  stderr "ai_file: required model '$MODEL' is not installed"
+  stderr "ai_file: run 'ollama pull $MODEL' and try again"
+  exit 1
+}
+
+build_prompt() {
+  local user_prompt="$1"
+
+  cat <<EOF
+All output from this model invocation will be written directly to a file and used verbatim.
+
+Rules:
+- Output only the file contents requested by the user.
+- Do not add Markdown fences.
+- Do not add explanations, notes, or any text outside the requested file content.
+- If the user asks for code, return only the code.
+- Assume the generated file will be saved in and used from the caller's current working directory.
+- If the user asks for "a script" without naming a language, default to a portable Bash script unless the task clearly requires something else.
+- If the request is ambiguous, make a reasonable implementation choice and return the finished file content.
+
+User request:
+$user_prompt
+EOF
+}
+
+run_ollama() {
+  local full_prompt="$1"
+  local stdout_file
+  local stderr_file
+  local status
+  local using_spinner=0
+  local removed_opening_fence=0
+  local removed_closing_fence=0
+
+  strip_wrapping_python_fences() {
+    local output_file="$1"
+    local first_nonempty_line
+    local last_nonempty_line
+    local temp_file
+
+    first_nonempty_line="$(awk 'NF { print; exit }' "$output_file")"
+    last_nonempty_line="$(awk 'NF { line = $0 } END { print line }' "$output_file")"
+
+    if [[ "$first_nonempty_line" =~ ^[[:space:]]*\`\`\`[[:space:]]*python([[:space:]].*)?$ ]] ||
+      [[ "$first_nonempty_line" =~ ^[[:space:]]*\`\`\`[[:space:]]*$ ]]; then
+      temp_file="$(mktemp "${TMPDIR:-/tmp}/ai_file.stdout.cleaned.XXXXXX")"
+      awk '
+        !removed && NF && $0 ~ /^[[:space:]]*```([[:space:]]*python([[:space:]].*)?)?[[:space:]]*$/ {
+          removed = 1
+          next
+        }
+        { print }
+      ' "$output_file" >"$temp_file"
+      mv "$temp_file" "$output_file"
+      removed_opening_fence=1
+    fi
+
+    if [[ "$last_nonempty_line" =~ ^[[:space:]]*\`\`\`[[:space:]]*$ ]]; then
+      temp_file="$(mktemp "${TMPDIR:-/tmp}/ai_file.stdout.cleaned.XXXXXX")"
+      awk '
+        { lines[NR] = $0 }
+        NF { last_nonempty = NR }
+        END {
+          for (i = 1; i <= NR; i++) {
+            if (i == last_nonempty && lines[i] ~ /^[[:space:]]*```[[:space:]]*$/) {
+              continue
+            }
+            print lines[i]
+          }
+        }
+      ' "$output_file" >"$temp_file"
+      mv "$temp_file" "$output_file"
+      removed_closing_fence=1
+    fi
+  }
+
+  stdout_file="$(mktemp "${TMPDIR:-/tmp}/ai_file.stdout.XXXXXX")"
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/ai_file.stderr.XXXXXX")"
+
+  if [[ ! -t 1 ]]; then
+    start_spinner "ai_file: generating with $MODEL"
+    using_spinner=1
+  fi
+
+  ollama run --hidethinking --nowordwrap "$MODEL" "$full_prompt" >"$stdout_file" 2>"$stderr_file" &
+  set +e
+  wait "$!"
+  status=$?
+  set -e
+
+  if [[ "$status" -eq 0 ]]; then
+    strip_wrapping_python_fences "$stdout_file"
+    cat "$stdout_file"
+    if [[ "$using_spinner" -eq 1 ]]; then
+      stop_spinner
+    else
+      :
+    fi
+    if [[ "$removed_opening_fence" -eq 1 ]]; then
+      stderr "ai_file: detected and removed opening markdown fence"
+    fi
+    if [[ "$removed_closing_fence" -eq 1 ]]; then
+      stderr "ai_file: detected and removed closing markdown fence"
+    fi
+    stderr "ai_file: generation complete with $MODEL"
+    rm -f "$stdout_file"
+    rm -f "$stderr_file"
+    return 0
+  fi
+
+  if [[ "$using_spinner" -eq 1 ]]; then
+    stop_spinner "ai_file: generation failed"
+  else
+    stderr "ai_file: generation failed"
+  fi
+  rm -f "$stdout_file"
+  cat "$stderr_file" >&2
+  rm -f "$stderr_file"
+  return "$status"
+}
+
+main() {
+  trap cleanup EXIT
+
+  if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  local user_prompt
+  local full_prompt
+
+  user_prompt="$(collect_prompt "$@")"
+
+  if [[ -z ${user_prompt//[$' \t\r\n']/} ]]; then
+    stderr "ai_file: prompt cannot be empty"
+    exit 64
+  fi
+
+  ensure_ollama_server
+  ensure_model
+  full_prompt="$(build_prompt "$user_prompt")"
+
+  run_ollama "$full_prompt"
+}
+
+main "$@"

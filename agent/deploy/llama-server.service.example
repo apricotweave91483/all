@@ -1,0 +1,17 @@
+[Unit]
+Description=llama.cpp model server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llm
+Group=llm
+WorkingDirectory=/opt/llama.cpp
+ExecStart=/opt/llama.cpp/build/bin/llama-server -m /opt/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --host 0.0.0.0 --port 8000 -c 8192 -ngl 99
+Restart=always
+RestartSec=5
+Environment=LLAMA_CACHE=/var/cache/llama.cpp
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+{
+  "title": true,
+  "info": ["OS", "Host", "Kernel", "Uptime", "Packages", "Shell", "Resolution", "DE", "WM", "WM Theme", "Theme", "Terminal", "CPU", "GPU", "Memory"],
+  "gap_spaces": 3,
+  "logo_file": "grm.txt",
+  "colors": null
+}
