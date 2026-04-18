@@ -1,8 +1,11 @@
 Usage: fetch [OPTIONS]
 
 Get a random Codeforces problem by difficulty range, or open a specific problem.
+
 Uses jq and the Codeforces API
+
 Options:
+```bash
   -d, --difficulty RANGE    Difficulty range (e.g. "800-1200" or "800")
   -p, --problem ID          Open a specific problem by ID (e.g. "1520A")
       --allow-repeat        Allow problems that have been seen before
@@ -14,7 +17,7 @@ Options:
       --remove ID           Remove a problem from the seen list (e.g. 151A)
   -h [N], --history [N]     Show the last N fetched problems (default 10)
       --help                Show this help message and exit
-
+```
 ```bash
   fetch --difficulty 800-1200
   fetch -d 1500-2000
