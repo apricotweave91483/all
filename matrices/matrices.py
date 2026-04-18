@@ -1,4 +1,4 @@
-# Handrwitten, BTW, first iteration of the Linear Algebra library, i thought it would be a nice exercise to try and writ the routine myself after learning about the algorithm in linear algebra class, then after doing that as an exercise and enjoying the fun of writing boilerplate and being able to implement something useful i learned in a class, I decided i wanted to level up to a real REPL library with some more functionality, so I vibe coded the next iteration, called "Linear_Algebra_Repl_Tool"
+# Handwritten; first iteration of the Linear Algebra library, i thought it would be a nice exercise to try and write the routine myself after learning about the algorithm in my class.
 
 from fractions import Fraction
 import numpy as np
